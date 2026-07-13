@@ -1,0 +1,14 @@
+# conda env create -f environment.yml 로 nano_vllm 환경을 한 번에 생성한다.
+# (torch/nano-vllm/flash-attn은 conda 채널이 아닌 pip 휠로 설치됨 — 아래 참고)
+name: nano_vllm
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu121
+      - torch==2.5.1
+      - nano-vllm==0.2.0
+      - transformers==5.12.1
+      - pandas>=2.2.0

@@ -1,0 +1,17 @@
+# 설치 순서가 중요하다 — torch를 먼저 설치해야 nano-vllm의 의존 패키지인
+# flash-attn이 빌드/휠 선택 시 torch ABI를 올바르게 인식한다.
+# 자세한 설치 절차는 README.md의 "설치" 절 또는 environment.yml 참고.
+
+# ── PyTorch (CUDA 12.1) ─────────────────────────────────────────────
+# pip install torch==2.5.1 --extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1
+
+# ── 서빙 엔진 ────────────────────────────────────────────────────────
+# flash-attn, triton, xxhash를 자동으로 함께 설치한다.
+nano-vllm==0.2.0
+
+# ── HF Transformers baseline (engine/transformers_baseline_engine.py) ──
+transformers==5.12.1
+
+# ── 데이터 처리 ─────────────────────────────────────────────────────
+pandas>=2.2.0
