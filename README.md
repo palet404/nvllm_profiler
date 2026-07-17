@@ -219,10 +219,6 @@ python scripts/baseline_run.py --num-requests 8 --tag baseline_throughput --save
 | Continuous Batching | 집계 처리량 **1.67배** | 요청이 동시에 몰릴수록 강함 |
 | nano-vLLM 전체 vs Transformers baseline | latency **2.4~5.7배**, 처리량 **1.5배** | 세 최적화가 누적된 결과 |
 
-특히 이 프로젝트의 워크로드(짧은 370토큰 프리픽스)에서는 Prefix Caching의 TTFT
-효과가 스케줄러/커널 고정 오버헤드(~20ms)에 묻혀 거의 보이지 않다가, 프리픽스를
-1015토큰으로 늘리면 뚜렷하게(1.35~1.5x) 드러난다 — 참조 자료를 그대로 재진술한 게
-아니라 실측으로만 확인 가능한 2차 인사이트다.
 
 ## 앞으로 추가해야 할 것
 
