@@ -139,7 +139,7 @@ class NanoVLLMProfilerEngine:
         seed: int = 0,
         continuous_batching: bool = True,
         disable_prefix_cache: bool = False,
-    ) -> list[RequestMetrics]:
+    ) -> list[RequestMetrics]: # 파라미터 기본값 설정
         """
         prompts를 arrival_interval_s 간격(지터 포함)으로 실제 시간차를 두고 도착시키면서,
         실제 GPU에서 처리한다. arrival_interval_s=0이면 전부 동시(burst)에 도착한
@@ -182,7 +182,7 @@ class NanoVLLMProfilerEngine:
                 and (continuous_batching or not (scheduler.waiting or scheduler.running))
             ):
                 i = order[next_pos]
-                batch_size_at_admit = len(scheduler.waiting) + len(scheduler.running)
+                batch_size_at_admit = len(scheduler.waiting) + len(scheduler.running) # "이 새 요청이 들어올 때, 시스템(스케줄러)이 이미 떠안고 있던 시퀀스 수" — 즉 GPU 자원을 두고 경쟁하는 총 동시 요청 수
                 seq = self._admit(prompts[i], max_output_tokens)
                 meta[seq.seq_id] = {
                     "prompt": prompts[i],
@@ -205,16 +205,16 @@ class NanoVLLMProfilerEngine:
             # postprocess가 num_cached_tokens를 덮어쓰기 전, 이번에 처음 등장한
             # 시퀀스의 '진짜' 프리픽스 캐시 히트 토큰 수를 스냅샷으로 남긴다.
             for seq in seqs:
-                m = meta[seq.seq_id]
-                if m["cached_tokens"] is None:
-                    m["cached_tokens"] = seq.num_cached_tokens
+                m = meta[seq.seq_id] # seq_id로 이 요청의 "메타데이터 딕셔너리" 조회
+                if m["cached_tokens"] is None: # 아직 스냅샷 안 떴으면 (=이 시퀀스가 배치에 처음 등장)
+                    m["cached_tokens"] = seq.num_cached_tokens  # BlockManager.allocate()가 방금 세팅한 값을 기록
 
             token_ids = self.llm.model_runner.call("run", seqs, is_prefill)
             scheduler.postprocess(seqs, token_ids, is_prefill)
             step_end = time.perf_counter()
 
             for seq in seqs:
-                m = meta[seq.seq_id]
+                m = meta[seq.seq_id] # 딕셔너리임 {int, dict(value)}
                 if m["ttft_time"] is None and seq.num_completion_tokens >= 1:
                     m["ttft_time"] = step_end
                 if seq.is_finished:

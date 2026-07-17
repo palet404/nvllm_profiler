@@ -1,0 +1,14 @@
+# Prometheus가 Pushgateway를 스크레이프하는 설정.
+#
+# honor_labels: true가 반드시 필요하다 — 이게 없으면 push된 메트릭의 job/instance
+# 라벨이 스크레이프 대상(pushgateway 자체)의 job/instance와 충돌해 exported_job/
+# exported_instance로 이름이 바뀌어버린다. run_tag별로 job을 구분해서 push하는 이
+# 프로젝트 구조상, 원본 job 라벨이 보존돼야 Grafana에서 run_tag/job으로 필터링할 수 있다.
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: "pushgateway"
+    honor_labels: true
+    static_configs:
+      - targets: ["pushgateway:9091"]

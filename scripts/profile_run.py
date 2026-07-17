@@ -82,6 +82,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="지정하면 results/<tag>.csv로 고정 파일명 저장 (비교 스위트가 모드를 식별하는 데 사용)",
     )
+    parser.add_argument(
+        "--push-metrics",
+        action="store_true",
+        help="실측 결과를 Prometheus Pushgateway로 전송 (job=--tag 또는 자동 생성된 태그)",
+    )
+    parser.add_argument(
+        "--pushgateway-url",
+        type=str,
+        default="localhost:9091",
+        help="Pushgateway 주소 (--push-metrics와 함께 사용)",
+    )
     return parser.parse_args()
 
 
@@ -192,6 +203,21 @@ def main() -> None:
     if args.save_csv or args.tag:
         path = save_csv(results, args.tag)
         print(f"\nCSV 저장 완료: {path}")
+
+    if args.push_metrics:
+        from engine.metrics_exporter import push_run_metrics
+
+        run_tag = args.tag or f"profile_run_{int(time.time())}"
+        push_run_metrics(
+            results,
+            gpu_history,
+            run_tag=run_tag,
+            cache_enabled=not args.disable_prefix_cache,
+            cuda_graph_enabled=not args.enforce_eager,
+            continuous_batching=not args.sequential,
+            pushgateway_url=args.pushgateway_url,
+        )
+        print(f"\nPushgateway로 메트릭 전송 완료 ({args.pushgateway_url}, job={run_tag})")
 
 
 if __name__ == "__main__":

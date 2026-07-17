@@ -61,11 +61,46 @@ nano-vLLM(Qwen3-0.6B, RTX 3070 Ti 8GB)의 세 가지 서빙 최적화 — **Pref
    JIT, cuBLAS 알고리즘 탐색 같은 1회성 비용을 흡수한다. 그렇지 않으면
    콜드스타트가 캐싱 효과를 완전히 가려버린다.
 
-### 시각화
+### 시각화 — Prometheus / Grafana 연동
 
-자체 대시보드는 만들지 않는다. 위 메트릭들을 CSV/로그로 남기는 것까지가 이
-프로젝트의 책임이고, 시각화는 Grafana 등 기존 프레임워크가 소비할 수 있는 형태로
-엔드포인트를 제공하는 방향으로 갈 것이다 (아래 "앞으로 추가해야 할 것" 참고).
+자체 대시보드는 만들지 않는다. `engine/metrics_exporter.py`가 `RequestMetrics`/
+`GPUSnapshot`을 Prometheus 메트릭(Histogram/Counter/Gauge)으로 변환해 Pushgateway로
+push하고, Grafana는 Prometheus를 데이터소스로 붙여 시각화한다.
+
+**Pushgateway를 쓰는 이유**: 이 프로젝트의 스크립트(`profile_run.py` 등)는 1회
+실행되고 끝나는 배치 작업이라, Prometheus가 pull(scrape)할 시점엔 프로세스가 이미
+종료돼 있다 — Pushgateway는 Prometheus 공식 문서가 명시하는 "서비스 레벨 배치
+작업" 용도에 정확히 해당한다.
+
+```bash
+# 1) Pushgateway / Prometheus / Grafana를 한 네트워크에 기동 (최초 1회)
+docker network create nanovllm-monitoring
+docker run -d --name pushgateway --network nanovllm-monitoring -p 9091:9091 \
+  --restart unless-stopped prom/pushgateway
+docker run -d --name prometheus --network nanovllm-monitoring -p 9090:9090 \
+  -v "$(pwd)/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
+  --restart unless-stopped prom/prometheus
+docker run -d --name grafana --network nanovllm-monitoring -p 3000:3000 \
+  -v "$(pwd)/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro" \
+  -v "$(pwd)/monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro" \
+  --restart unless-stopped grafana/grafana
+
+# 2) 벤치마크 실행 시 --push-metrics만 추가하면 자동으로 Pushgateway에 전송됨
+python scripts/profile_run.py --num-requests 8 --tag nanovllm_full_ttft --push-metrics
+python scripts/run_comparison_suite.py --num-requests 8 --push-metrics   # 5개 모드 전부 push
+
+# 3) http://localhost:3000 (admin/admin) 접속 → "nano-vLLM Profiler" 대시보드 자동 로드됨
+```
+
+`monitoring/prometheus.yml`은 `honor_labels: true`로 Pushgateway를 스크레이프한다
+(안 하면 push된 `run_tag` 라벨이 `exported_job` 등으로 이름이 바뀐다).
+`monitoring/grafana/provisioning/`은 Grafana 기동 시 Prometheus 데이터소스와
+대시보드(TTFT/Latency p95, 집계 TPS, cache hit ratio, GPU util/VRAM — 전부
+`run_tag`별 비교)를 자동 등록한다.
+
+request_id/arrival_time처럼 계속 바뀌는 값은 라벨로 쓰지 않는다 — Pushgateway는
+push된 시계열을 자동 만료시키지 않으므로, `run_tag`/`cache_enabled`/
+`cuda_graph_enabled`/`continuous_batching`처럼 cardinality가 유한한 값만 라벨로 쓴다.
 
 ## 프로젝트 구조
 
@@ -76,12 +111,16 @@ nvllm_profiler/
 ├── engine/
 │   ├── nanovllm_engine.py                 실제 nanovllm.LLM 래퍼 (핵심 프로파일링 로직)
 │   ├── transformers_baseline_engine.py    HF Transformers baseline (비교용)
-│   └── gpu_metrics.py                     nvidia-smi 실측 폴링 데몬
+│   ├── gpu_metrics.py                     nvidia-smi 실측 폴링 데몬
+│   └── metrics_exporter.py                RequestMetrics/GPUSnapshot → Prometheus 메트릭 변환 + Pushgateway 전송
 ├── scripts/
-│   ├── profile_run.py                     단일 모드 실행 (ablation 플래그)
-│   ├── baseline_run.py                    Transformers baseline 실행
-│   ├── run_comparison_suite.py            5개 모드 자동 비교
+│   ├── profile_run.py                     단일 모드 실행 (ablation 플래그, --push-metrics)
+│   ├── baseline_run.py                    Transformers baseline 실행 (--push-metrics)
+│   ├── run_comparison_suite.py            5개 모드 자동 비교 (--push-metrics)
 │   └── decode_length_sweep.py             출력 길이별 최적화 기여도 스윕
+├── monitoring/
+│   ├── prometheus.yml                     Pushgateway 스크레이프 설정
+│   └── grafana/provisioning, dashboards/  Grafana 데이터소스/대시보드 자동 프로비저닝
 ├── results/                                CSV 원시 로그 (git-ignored, 로컬 실행 시 생성됨)
 └── RESULTS.md                              실험 결과 상세 (방법론 + 수치 + 해석)
 ```
@@ -187,9 +226,6 @@ python scripts/baseline_run.py --num-requests 8 --tag baseline_throughput --save
 
 ## 앞으로 추가해야 할 것
 
-- **로그/메트릭 엔드포인트**: `RequestMetrics`/`GPUSnapshot`을 Prometheus exposition
-  format이나 JSON Lines 등으로 노출해, Grafana 같은 기존 시각화 프레임워크가 바로
-  붙을 수 있게 한다 (자체 대시보드는 만들지 않기로 결정함).
 - **더 큰 모델/긴 컨텍스트 검증**: 현재 Qwen3-0.6B + 8GB VRAM 제약으로 실험한
   결과이므로, 더 큰 모델이나 실제 RAG 수준의 긴 프리픽스(수천 토큰)에서 Prefix
   Caching 효과가 얼마나 더 커지는지 추가 검증이 필요하다.

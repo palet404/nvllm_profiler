@@ -15,3 +15,8 @@ transformers==5.12.1
 
 # ── 데이터 처리 ─────────────────────────────────────────────────────
 pandas>=2.2.0
+
+# ── Prometheus 연동 (engine/metrics_exporter.py) ──────────────────────
+# Pushgateway 서버 자체는 Python 패키지가 아니라 Docker로 별도 실행:
+#   docker run -d -p 9091:9091 prom/pushgateway
+prometheus-client>=0.20.0

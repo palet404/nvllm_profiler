@@ -80,6 +80,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--duplicate-ratio", type=float, default=0.3)
     parser.add_argument("--max-output-tokens", type=int, default=24)
     parser.add_argument("--skip-baseline", action="store_true", help="HF Transformers baseline 모드들을 생략")
+    parser.add_argument(
+        "--push-metrics",
+        action="store_true",
+        help="각 모드 실행 결과를 Prometheus Pushgateway로 전송 (job=모드별 태그)",
+    )
+    parser.add_argument(
+        "--pushgateway-url",
+        type=str,
+        default="localhost:9091",
+        help="Pushgateway 주소 (--push-metrics와 함께 사용)",
+    )
     return parser.parse_args()
 
 
@@ -96,6 +107,8 @@ def run_mode(mode: dict, args: argparse.Namespace) -> bool:
         "--save-csv",
         *mode["extra_flags"],
     ]
+    if args.push_metrics:
+        cmd += ["--push-metrics", "--pushgateway-url", args.pushgateway_url]
     print(f"\n{'='*70}\n{mode['label']}  ({mode['tag']})\n{'='*70}")
     print(" ".join(cmd))
     t0 = time.perf_counter()

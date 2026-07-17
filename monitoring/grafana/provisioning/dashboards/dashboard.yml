@@ -1,0 +1,13 @@
+# /var/lib/grafana/dashboards 아래의 JSON 파일들을 Grafana 기동 시 자동으로 로드한다.
+apiVersion: 1
+
+providers:
+  - name: "nano-vLLM Profiler"
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
