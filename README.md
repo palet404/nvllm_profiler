@@ -1,79 +1,82 @@
 # nano-vLLM Profiler
 
-nano-vLLM(Qwen3-0.6B, RTX 3070 Ti 8GB)의 세 가지 서빙 최적화 — **Prefix Caching**,
-**Continuous Batching**, **CUDA Graph** — 를 실제 GPU 추론으로 실측하는 프로파일링
-툴킷. 더미/시뮬레이션 수치는 없으며, 모든 결과는 실제 모델 로드 + 실제 GPU 연산에서
-나온다.
+nano-vLLM(Qwen3-0.6B)과 HF Transformers baseline을 실제 GPU 추론으로 실측 비교하는
+프로파일링 툴킷. 더미/시뮬레이션 수치는 없고, 모든 결과는 실제 모델 로드 + 실제 GPU
+연산 + Prometheus에 실제로 저장된 값에서 나온다.
 
-## 시나리오
+## 환경
 
-사내 이메일에서 업무 제출 기한과 제출물을 추출하는 어시스턴트를 가정한다
-(`workload/generator.py`, `config.py`). 모든 요청은 다음 구조를 갖는다.
-
-```
-[공통 시스템 프롬프트: 추출 규칙 + few-shot 예시]  ← 모든 요청에 토큰 단위로 동일
-[가변 이메일 본문: 발신팀/제출물/기한/문구가 매번 다름]
-```
-
-- **`SYSTEM_PREFIX`** (~370토큰, KV 캐시 1블록): 기본 프리픽스.
-- **`LONG_SYSTEM_PREFIX`** (~1015토큰, KV 캐시 4블록): few-shot 예시를 7개로 늘려
-  RAG/few-shot이 많은 프로덕션급 시스템 프롬프트 규모를 흉내낸 스트레스 테스트용.
-- **`duplicate_ratio`**: 이미 생성한 이메일을 그대로 재전송할 확률. 본문까지 100%
-  캐시 히트하는 극단적 케이스를 재현할 때 쓴다.
-
-공통 프리픽스가 모든 요청 앞에 토큰 단위로 동일하게 붙기 때문에, nano-vLLM의
-`BlockManager`가 해당 KV 블록을 재계산 없이 참조 카운트만 올려 재사용하는지
-(Prefix Caching) 관찰할 수 있다.
-
-## 프로파일러 작동 방식
-
-### 무엇을 재는가 (`engine/nanovllm_engine.py::RequestMetrics`)
-
-| 메트릭 | 의미 |
+| 항목 | 버전 |
 |---|---|
-| `ttft_ms` | Time To First Token — 도착부터 첫 토큰까지 |
-| `tps` | 초당 생성 토큰 수 (처리량) |
-| `latency_ms` | 도착부터 전체 완료까지 |
-| `cached_tokens` / `prefix_cache_hit` | Prefix Cache로 재사용된 KV 토큰 수 |
-| `new_prefill_tokens` | 캐시 미스라 새로 prefill해야 한 토큰 수 |
-| `batch_size_at_admit` | 요청 도착 시점에 이미 대기/실행 중이던 시퀀스 수 |
+| OS | Ubuntu 24.04.4 LTS (kernel 6.17) |
+| GPU | NVIDIA GeForce RTX 3070 Ti, 8GB VRAM |
+| NVIDIA 드라이버 | 595.71.05 |
+| Python | 3.10 (conda env `nano_vllm`) |
+| PyTorch | 2.5.1+cu121 |
+| nano-vllm | 0.2.0 (FlashAttention + CUDA Graph + PagedAttention 내장) |
+| Transformers | 5.12.1 (baseline, `attn_implementation="flash_attention_2"`) |
+| 모델 | Qwen3-0.6B (`--model-path`, 기본값 `~/huggingface/Qwen3-0.6B`) |
 
-`engine/gpu_metrics.py`가 별도 스레드에서 `nvidia-smi`를 폴링해 GPU 사용률/VRAM
-시계열(`GPUSnapshot`)을 함께 수집한다.
+CUDA Toolkit을 시스템에 따로 설치할 필요는 없다 — `torch==2.5.1+cu121`, `flash-attn`
+모두 CUDA 런타임이 포함된 pip 휠로 설치된다. 필요한 건 GPU와 그에 맞는 NVIDIA
+드라이버뿐이다.
 
-### 어떻게 재는가
-
-1. **스케줄러 3단계를 직접 호출**: `LLMEngine.step()`을 그대로 쓰지 않고
-   `scheduler.schedule() → model_runner.call("run") → scheduler.postprocess()`를
-   직접 풀어서 호출한다. `step()`의 반환값만으로는 "이번 스텝에 첫 토큰을 받은"
-   시퀀스(TTFT)를 알 수 없기 때문이다.
-2. **Prefix Cache 히트량은 스냅샷 타이밍이 핵심**: `postprocess()`가
-   `num_cached_tokens`를 "누적 계산된 토큰 수" 카운터로 재사용해버리므로,
-   `schedule()` 직후 postprocess가 덮어쓰기 전에 스냅샷을 떠야 진짜 캐시 히트량을
-   얻는다.
-3. **Ablation 스위치로 최적화 기여도 격리**:
-   - `set_prefix_cache_enabled(bool)` — `BlockManager.can_allocate`를 몽키패치해
-     캐시 조회만 끄고 블록 할당/해제 로직은 그대로 둔다.
-   - `continuous_batching=False` — admit 타이밍만 바꿔 "배치가 완전히 비어야
-     다음 배치를 받는" 정적 스케줄링을 재현한다 (스케줄러/블록매니저는 그대로).
-   - `enforce_eager` — CUDA Graph on/off.
-4. **GPU 워밍업 필수**: 측정 전 더미 프롬프트로 한 번 돌려서 Triton/flash-attn
-   JIT, cuBLAS 알고리즘 탐색 같은 1회성 비용을 흡수한다. 그렇지 않으면
-   콜드스타트가 캐싱 효과를 완전히 가려버린다.
-
-### 시각화 — Prometheus / Grafana 연동
-
-자체 대시보드는 만들지 않는다. `engine/metrics_exporter.py`가 `RequestMetrics`/
-`GPUSnapshot`을 Prometheus 메트릭(Histogram/Counter/Gauge)으로 변환해 Pushgateway로
-push하고, Grafana는 Prometheus를 데이터소스로 붙여 시각화한다.
-
-**Pushgateway를 쓰는 이유**: 이 프로젝트의 스크립트(`profile_run.py` 등)는 1회
-실행되고 끝나는 배치 작업이라, Prometheus가 pull(scrape)할 시점엔 프로세스가 이미
-종료돼 있다 — Pushgateway는 Prometheus 공식 문서가 명시하는 "서비스 레벨 배치
-작업" 용도에 정확히 해당한다.
+### 설치 — conda로 한 번에 (권장)
 
 ```bash
-# 1) Pushgateway / Prometheus / Grafana를 한 네트워크에 기동 (최초 1회)
+conda env create -f environment.yml
+conda activate nano_vllm
+
+# 설치 확인
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+`environment.yml`은 Python 3.10 conda 환경을 만들고, 그 안에 pip로 `torch==2.5.1+cu121`
+→ `nano-vllm==0.2.0`(flash-attn/triton/xxhash 자동 포함) → `transformers==5.12.1` →
+`pandas`/`prometheus-client`/`datasets`를 이 순서로 설치한다(torch가 먼저 설치돼야
+flash-attn이 올바른 ABI로 빌드/선택됨). `requirements.txt`도 같은 패키지/버전을
+담고 있어 `pip install -r requirements.txt`로 기존 conda/venv 환경에 수동 설치해도
+동일하다.
+
+nano-vLLM과 Transformers는 같은 GPU(8GB)에 동시에 못 올라가므로(VRAM 충돌) 항상
+별도 프로세스로 순차 실행한다.
+
+## 프로파일러 구조
+
+```
+nvllm_profiler/
+├── workload/dataset_loaders.py            공개 벤치마크 데이터셋(SQuAD 등) → 프롬프트 로더
+├── engine/
+│   ├── nanovllm_engine.py                 실제 nanovllm.LLM 래퍼 (PagedAttention/CUDA Graph/Prefix Caching)
+│   ├── transformers_baseline_engine.py    HF Transformers baseline — flash_attention_2 + 수동 prefill/decode 루프
+│   ├── gpu_metrics.py                     nvidia-smi 실측 폴링 데몬
+│   └── metrics_exporter.py                RequestMetrics/GPUSnapshot → Prometheus 메트릭 변환 + Pushgateway 전송
+├── scripts/
+│   ├── _common.py                         두 프로파일링 스크립트가 공유하는 배관(시나리오 로딩, Pushgateway 출력, PromQL 헬퍼)
+│   ├── profile_nanovllm.py                nano-vLLM 실측 (technique/ablation 플래그, --push-metrics)
+│   └── profile_transformers_baseline.py   HF Transformers baseline 실측 (--dataset 4종, --query-only, --push-metrics)
+├── utils/
+│   └── export_metrics_from_prometheus.py  Prometheus DB에 쌓인 run_tag 하나를 PromQL로 조회해 CSV로 재구성
+├── monitoring/
+│   ├── prometheus.yml                     Pushgateway 스크레이프 설정 (honor_labels: true)
+│   └── grafana/                           대시보드 JSON + 프로비저닝 (run_tag 필터 변수 포함)
+└── results/                                CSV 산출물 (git-ignored, utils/export_metrics_from_prometheus.py가 생성)
+```
+
+**데이터 흐름**: 실행 스크립트(`profile_nanovllm.py`/`profile_transformers_baseline.py`)가
+요청을 하나씩 처리하며 `RequestMetrics`(TTFT/latency/tps/prompt_tokens/output_tokens 등)를
+쌓고, `--push-metrics`를 주면 `engine/metrics_exporter.py`가 이걸 Prometheus 메트릭으로
+변환해 **Pushgateway**로 push한다. Prometheus가 Pushgateway를 5초 간격으로 스크레이프해
+저장하고, Grafana가 그 위에 대시보드를 그린다. 로컬 CSV를 직접 저장하는 경로는 없다 —
+결과는 항상 Prometheus가 실제로 갖고 있는 값을 `utils/export_metrics_from_prometheus.py`로
+다시 꺼내서 확인한다.
+
+Pushgateway를 쓰는 이유: 이 프로젝트의 스크립트는 1회 실행되고 끝나는 배치 작업이라,
+Prometheus가 직접 pull(scrape)할 시점엔 프로세스가 이미 종료돼 있기 때문이다.
+
+## 모니터링 스택 기동 (최초 1회)
+
+```bash
 docker network create nanovllm-monitoring
 docker run -d --name pushgateway --network nanovllm-monitoring -p 9091:9091 \
   --restart unless-stopped prom/pushgateway
@@ -84,159 +87,96 @@ docker run -d --name grafana --network nanovllm-monitoring -p 3000:3000 \
   -v "$(pwd)/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro" \
   -v "$(pwd)/monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro" \
   --restart unless-stopped grafana/grafana
-
-# 2) 벤치마크 실행 시 --push-metrics만 추가하면 자동으로 Pushgateway에 전송됨
-python scripts/profile_run.py --num-requests 8 --tag nanovllm_full_ttft --push-metrics
-python scripts/run_comparison_suite.py --num-requests 8 --push-metrics   # 5개 모드 전부 push
-
-# 3) http://localhost:3000 (admin/admin) 접속 → "nano-vLLM Profiler" 대시보드 자동 로드됨
+# → http://localhost:3000 (admin/admin) 에서 "nano-vLLM Profiler" 대시보드 자동 로드
 ```
 
-`monitoring/prometheus.yml`은 `honor_labels: true`로 Pushgateway를 스크레이프한다
-(안 하면 push된 `run_tag` 라벨이 `exported_job` 등으로 이름이 바뀐다).
-`monitoring/grafana/provisioning/`은 Grafana 기동 시 Prometheus 데이터소스와
-대시보드(TTFT/Latency p95, 집계 TPS, cache hit ratio, GPU util/VRAM — 전부
-`run_tag`별 비교)를 자동 등록한다.
+## 실행했던 실험 재현하기
 
-request_id/arrival_time처럼 계속 바뀌는 값은 라벨로 쓰지 않는다 — Pushgateway는
-push된 시계열을 자동 만료시키지 않으므로, `run_tag`/`cache_enabled`/
-`cuda_graph_enabled`/`continuous_batching`처럼 cardinality가 유한한 값만 라벨로 쓴다.
-
-## 프로젝트 구조
-
-```
-nvllm_profiler/
-├── config.py                              MODEL_PATH, SYSTEM_PREFIX, LONG_SYSTEM_PREFIX
-├── workload/generator.py                  가상 이메일 워크로드 생성기
-├── engine/
-│   ├── nanovllm_engine.py                 실제 nanovllm.LLM 래퍼 (핵심 프로파일링 로직)
-│   ├── transformers_baseline_engine.py    HF Transformers baseline (비교용)
-│   ├── gpu_metrics.py                     nvidia-smi 실측 폴링 데몬
-│   └── metrics_exporter.py                RequestMetrics/GPUSnapshot → Prometheus 메트릭 변환 + Pushgateway 전송
-├── scripts/
-│   ├── profile_run.py                     단일 모드 실행 (ablation 플래그, --push-metrics)
-│   ├── baseline_run.py                    Transformers baseline 실행 (--push-metrics)
-│   ├── run_comparison_suite.py            5개 모드 자동 비교 (--push-metrics)
-│   └── decode_length_sweep.py             출력 길이별 최적화 기여도 스윕
-├── monitoring/
-│   ├── prometheus.yml                     Pushgateway 스크레이프 설정
-│   └── grafana/provisioning, dashboards/  Grafana 데이터소스/대시보드 자동 프로비저닝
-├── results/                                CSV 원시 로그 (git-ignored, 로컬 실행 시 생성됨)
-└── RESULTS.md                              실험 결과 상세 (방법론 + 수치 + 해석)
-```
-
-## 환경
-
-아래는 실측을 검증한 실제 환경이다. 다른 조합(GPU/드라이버/CUDA 버전)에서도 동작할
-가능성이 높지만 검증된 것은 아니다.
-
-| 항목 | 버전 |
-|---|---|
-| OS | Ubuntu 24.04.4 LTS (kernel 6.17) |
-| GPU | NVIDIA GeForce RTX 3070 Ti, 8GB VRAM |
-| NVIDIA 드라이버 | 595.71.05 |
-| Python | 3.10 (conda env `nano_vllm`) |
-| PyTorch | 2.5.1 (`+cu121` 휠, pip로 설치 — 시스템에 별도 CUDA Toolkit/`nvcc` 불필요) |
-| nano-vllm | 0.2.0 |
-| Transformers | 5.12.1 |
-| 모델 | Qwen3-0.6B (`~/huggingface/Qwen3-0.6B` 경로 가정, `config.py`에서 변경 가능) |
-
-**시스템에 CUDA Toolkit을 따로 설치할 필요는 없다** — PyTorch·flash-attn 모두 CUDA
-런타임이 포함된 pip 휠(`torch==2.5.1+cu121`, `nvidia-cu12-*` 패키지들)로 설치되고,
-필요한 건 GPU와 그에 맞는 NVIDIA 드라이버뿐이다.
-
-## 설치
-
-GPU가 있는 Ubuntu 24.04 머신에서, NVIDIA 드라이버(`nvidia-smi`가 동작하는지로 확인)만
-설치돼 있으면 된다.
-
-### 방법 1 — conda로 한 번에 (권장)
+SQuAD `Sexual_orientation` 문서를 프리픽스로 고정하고, 같은 30개 질문으로 세 가지
+조건을 비교한다: Transformers(prefix 포함) vs Transformers(prefix 없이 query만) vs
+nano-vLLM(prefix caching 적용).
 
 ```bash
-conda env create -f environment.yml
-conda activate nano_vllm
+# 1) Transformers baseline — 문서 + 질문 (매 요청 prefix 재계산)
+python scripts/profile_transformers_baseline.py \
+  --dataset squad --squad-title Sexual_orientation \
+  --num-requests 30 --target-prefix-tokens 1900 --max-output-tokens 48 \
+  --tag "transformers(title+query)" --push-metrics
+
+# 2) Transformers baseline — 질문만 (prefix 재계산 비용 분리한 대조군)
+python scripts/profile_transformers_baseline.py \
+  --dataset squad --squad-title Sexual_orientation \
+  --num-requests 30 --target-prefix-tokens 1900 --max-output-tokens 48 \
+  --query-only \
+  --tag "transformers(query_only)" --push-metrics
+
+# 3) nano-vLLM — 문서 + 질문, prefix caching 적용, 순차 처리(batch=1)로 통제
+python scripts/profile_nanovllm.py \
+  --technique prefix_cache \
+  --dataset squad --squad-title Sexual_orientation \
+  --num-requests 30 --target-prefix-tokens 1900 --max-output-tokens 48 \
+  --sequential \
+  --tag "nanovllm(title+query)" --push-metrics
+
+# 4) Prometheus에서 결과 CSV로 재구성 (각 run_tag마다)
+python utils/export_metrics_from_prometheus.py --run-tag "transformers(title+query)"
+python utils/export_metrics_from_prometheus.py --run-tag "transformers(query_only)"
+python utils/export_metrics_from_prometheus.py --run-tag "nanovllm(title+query)"
 ```
 
-`environment.yml`은 Python 3.10 conda 환경을 만들고, 그 안에 pip로
-`torch==2.5.1+cu121` → `nano-vllm`(flash-attn/triton/xxhash 자동 포함) →
-`transformers` → `pandas`를 순서대로 설치한다.
+`--sequential`(nano-vLLM)은 Continuous Batching 이득을 배제해서, Transformers baseline과
+똑같이 배치 크기 1·순차 도착 조건에서 prefix caching + CUDA Graph + FlashAttention만의
+효과를 1:1로 비교하기 위한 것이다. 두 스크립트의 `--target-prefix-tokens`는 반드시
+같은 값을 써야 한다 — 값이 다르면 포함되는 문단 집합이 달라져서 같은 30개 질문을
+비교한다는 보장이 깨진다.
 
-### 방법 2 — 기존 conda(또는 venv) 환경에 수동 설치
-
-`nano-vllm`의 의존 패키지인 `flash-attn`이 빌드/휠 선택 시점에 이미 설치된 torch의
-ABI를 참조하므로, **torch를 먼저 설치**해야 한다.
+### 결과 확인
 
 ```bash
-conda create -n nano_vllm python=3.10 -y
-conda activate nano_vllm
-pip install -r requirements.txt
+# 요청별 TTFT (request_index 순서대로) — @csv는 값에 큰따옴표를 씌우므로 sort -n 전에 벗겨낸다
+curl -s 'http://localhost:9090/api/v1/query' \
+  --data-urlencode 'query=nanovllm_request_ttft_milliseconds{run_tag="transformers(title+query)"}' \
+  | jq -r '.data.result[] | [.metric.request_index, .value[1]] | @csv' | tr -d '"' | sort -t, -k1 -n
+
+# 집계 평균 (Histogram의 _sum/_count) — 반드시 한 줄로: --data-urlencode 값 앞에 개행이 섞이면
+# "query" 대신 "\nquery"라는 필드명으로 전송돼 Prometheus가 파싱을 못 한다
+curl -s 'http://localhost:9090/api/v1/query' --data-urlencode 'query=nanovllm_ttft_milliseconds_sum{run_tag="transformers(title+query)"} / nanovllm_ttft_milliseconds_count{run_tag="transformers(title+query)"}' | jq .
 ```
 
-`requirements.txt`의 패키지 순서(torch → nano-vllm → transformers → pandas)를 그대로
-따르면 된다. 만약 `flash-attn` 설치 단계에서 소스 빌드가 시도되며 실패한다면(드문
-경우 — 이 환경에서는 PyPI의 prebuilt 휠이 그대로 설치됨), torch가 이미 설치된
-상태에서 아래처럼 재시도한다.
+Grafana 대시보드는 상단 `run_tag` 드롭다운(다중 선택 + All)으로 원하는 run만 골라
+TTFT/Latency/TPS/GPU Util/VRAM Util 패널을 볼 수 있다.
+
+## 다른 시나리오로 실행하기
 
 ```bash
-pip install nano-vllm==0.2.0 --no-build-isolation
+# nano-vLLM: technique별 기본 데이터셋 자동 적용 (--dataset 생략 가능)
+python scripts/profile_nanovllm.py --technique prefix_cache --num-requests 12 --push-metrics
+python scripts/profile_nanovllm.py --technique cuda_graph --num-requests 8 --max-output-tokens 256 --push-metrics
+python scripts/profile_nanovllm.py --technique continuous_batching --num-requests 24 --arrival-interval-s 0.05 --push-metrics
+
+# ablation 플래그로 최적화 하나씩 끄기
+python scripts/profile_nanovllm.py --technique cuda_graph --num-requests 8 --enforce-eager --push-metrics          # CUDA Graph 끄기
+python scripts/profile_nanovllm.py --technique prefix_cache --num-requests 12 --disable-prefix-cache --push-metrics # Prefix Caching 끄기
+python scripts/profile_nanovllm.py --technique continuous_batching --num-requests 24 --sequential --push-metrics    # Continuous Batching 끄기
+
+# Transformers baseline: --dataset 4종(tool_catalog/squad/math500/kmmlu) 전부 지원
+python scripts/profile_transformers_baseline.py --dataset math500 --num-requests 8 --max-output-tokens 256 --push-metrics
 ```
 
-### 설치 확인
+`--dataset` 종류: `tool_catalog`(glaive-function-calling-v2), `squad`(rajpurkar/squad),
+`math500`(HuggingFaceH4/MATH-500), `kmmlu`(HAERAE-HUB/KMMLU).
 
-```bash
-python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
-```
+**모델/GPU 설정도 전부 CLI 인자다** (별도 설정 파일 없음, 두 프로파일링 스크립트 공통):
 
-## 실행
-
-```bash
-# 단일 실행
-python scripts/profile_run.py --num-requests 20 --duplicate-ratio 0.4
-
-# ablation 플래그
-python scripts/profile_run.py --num-requests 8 --enforce-eager           # CUDA Graph 끄기
-python scripts/profile_run.py --num-requests 8 --disable-prefix-cache    # Prefix Caching 끄기
-python scripts/profile_run.py --num-requests 8 --sequential              # Continuous Batching 끄기
-
-# 5개 모드(정상/3가지 ablation/baseline) 자동 비교
-python scripts/run_comparison_suite.py --num-requests 8 --max-output-tokens 24
-
-# 출력 길이별 스윕
-python scripts/decode_length_sweep.py --output-lengths 8,32,64,128,256 --num-requests 4
-
-# Transformers baseline만 단독 실행
-python scripts/baseline_run.py --num-requests 8 --tag baseline_throughput --save-csv
-```
-
-## 실험 결과 요약
-
-자세한 방법론과 수치, 해석은 [RESULTS.md](RESULTS.md)에 정리했다. 핵심만 요약하면:
-
-| 최적화 | 확인된 효과 | 어떤 조건에서 뚜렷한가 |
+| 플래그 | 기본값 | 의미 |
 |---|---|---|
-| CUDA Graph | latency/TPS 최대 **4.6~5.5배** | 출력이 길수록 (decode-bound) 강함 |
-| Prefix Caching | TTFT **1.0~1.5배** (캐시 토큰 수에 비례) | 캐시 토큰 절대량이 클수록, 출력이 짧을수록 강함 |
-| Continuous Batching | 집계 처리량 **1.67배** | 요청이 동시에 몰릴수록 강함 |
-| nano-vLLM 전체 vs Transformers baseline | latency **2.4~5.7배**, 처리량 **1.5배** | 세 최적화가 누적된 결과 |
+| `--model-path` | `~/huggingface/Qwen3-0.6B` | 로드할 모델 경로 |
+| `--max-model-len` | `8192` | [nano-vLLM만] KV 캐시가 수용할 최대 시퀀스 길이 |
+| `--gpu-memory-utilization` | `0.85` | [nano-vLLM만] 예약할 VRAM 비율 |
+| `--gpu-poll-interval-s` | `0.5` | nvidia-smi 폴링 주기(초) |
+| `--gpu-history-maxlen` | `600` | GPU 스냅샷 히스토리 보관 개수 |
 
-특히 이 프로젝트의 워크로드(짧은 370토큰 프리픽스)에서는 Prefix Caching의 TTFT
-효과가 스케줄러/커널 고정 오버헤드(~20ms)에 묻혀 거의 보이지 않다가, 프리픽스를
-1015토큰으로 늘리면 뚜렷하게(1.35~1.5x) 드러난다 — 참조 자료를 그대로 재진술한 게
-아니라 실측으로만 확인 가능한 2차 인사이트다.
-
-## 앞으로 추가해야 할 것
-
-- **더 큰 모델/긴 컨텍스트 검증**: 현재 Qwen3-0.6B + 8GB VRAM 제약으로 실험한
-  결과이므로, 더 큰 모델이나 실제 RAG 수준의 긴 프리픽스(수천 토큰)에서 Prefix
-  Caching 효과가 얼마나 더 커지는지 추가 검증이 필요하다.
-- **동시 요청 규모 확대**: 현재 8건 수준의 burst로 Continuous Batching을 검증했는데,
-  더 많은 동시 요청(수십~수백 건)에서의 스케일링도 확인할 가치가 있다.
-
-## 참고
-
-- 실제 nano-vLLM 내부 동작(`Sequence.__len__`, `BlockManager.can_allocate` 등)을
-  기반으로 계측했으므로, 코드를 수정할 때는
-  `nanovllm/engine/scheduler.py`, `block_manager.py`, `sequence.py` 소스를 먼저
-  확인할 것을 권장한다.
-- 이 프로젝트는 Knou/Bench_server(HF Transformers vs nano-vLLM 실측 벤치마크)와는
-  별개의 독립 포트폴리오 프로젝트다.
+```bash
+python scripts/profile_nanovllm.py --technique prefix_cache --num-requests 12 \
+  --model-path ~/huggingface/Qwen3-0.6B --max-model-len 4096 --gpu-memory-utilization 0.7 --push-metrics
+```

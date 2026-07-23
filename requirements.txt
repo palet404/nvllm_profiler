@@ -20,3 +20,7 @@ pandas>=2.2.0
 # Pushgateway 서버 자체는 Python 패키지가 아니라 Docker로 별도 실행:
 #   docker run -d -p 9091:9091 prom/pushgateway
 prometheus-client>=0.20.0
+
+# ── 실제 벤치마크 데이터셋 (workload/real_datasets.py, scripts/profile_real_datasets.py) ──
+# MATH-500 / glaive-function-calling-v2 / KMMLU를 HuggingFace Hub에서 로드하는 데 사용.
+datasets>=2.19.0

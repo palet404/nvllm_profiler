@@ -15,8 +15,6 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
-from config import GPU_HISTORY_MAXLEN, GPU_POLL_INTERVAL_S
-
 _NVIDIA_SMI_QUERY = [
     "nvidia-smi",
     "--query-gpu=utilization.gpu,memory.used,memory.total",
@@ -79,7 +77,7 @@ class GPUProfilerDaemon:
     최근 GPU_HISTORY_MAXLEN개의 스냅샷만 보관한다(deque).
     """
 
-    def __init__(self, interval_s: float = GPU_POLL_INTERVAL_S, maxlen: int = GPU_HISTORY_MAXLEN):
+    def __init__(self, interval_s: float = 0.5, maxlen: int = 600):
         self._interval_s = interval_s
         self._history: deque[GPUSnapshot] = deque(maxlen=maxlen)
         self._lock = threading.Lock()

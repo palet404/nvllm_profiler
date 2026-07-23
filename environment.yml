@@ -1,5 +1,7 @@
 # conda env create -f environment.yml 로 nano_vllm 환경을 한 번에 생성한다.
 # (torch/nano-vllm/flash-attn은 conda 채널이 아닌 pip 휠로 설치됨 — 아래 참고)
+# requirements.txt와 동일한 패키지/버전 — 실제 개발 환경(nano_vllm conda env)에서
+# `pip show`로 확인한 값 그대로다.
 name: nano_vllm
 channels:
   - conda-forge
@@ -9,6 +11,9 @@ dependencies:
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cu121
       - torch==2.5.1
+      # nano-vllm 설치 시 flash-attn(2.8.3.post1 확인됨)/triton/xxhash가 자동으로 함께 설치된다.
       - nano-vllm==0.2.0
       - transformers==5.12.1
       - pandas>=2.2.0
+      - prometheus-client>=0.20.0
+      - datasets>=2.19.0
