@@ -180,3 +180,20 @@ python scripts/profile_transformers_baseline.py --dataset math500 --num-requests
 python scripts/profile_nanovllm.py --technique prefix_cache --num-requests 12 \
   --model-path ~/huggingface/Qwen3-0.6B --max-model-len 4096 --gpu-memory-utilization 0.7 --push-metrics
 ```
+
+## 앞으로 추가해야 할 것
+
+- **더 큰 모델/긴 컨텍스트 검증**: 현재 Qwen3-0.6B + 8GB VRAM 제약으로 실험한
+  결과이므로, 더 큰 모델이나 실제 RAG 수준의 긴 프리픽스(수천 토큰)에서 Prefix
+  Caching 효과가 얼마나 더 커지는지 추가 검증이 필요하다.
+- **동시 요청 규모 확대**: 현재 8건 수준의 burst로 Continuous Batching을 검증했는데,
+  더 많은 동시 요청(수십~수백 건)에서의 스케일링도 확인할 가치가 있다.
+
+## 참고
+
+- 실제 nano-vLLM 내부 동작(`Sequence.__len__`, `BlockManager.can_allocate` 등)을
+  기반으로 계측했으므로, 코드를 수정할 때는
+  `nanovllm/engine/scheduler.py`, `block_manager.py`, `sequence.py` 소스를 먼저
+  확인할 것을 권장한다.
+- 이 프로젝트는 Knou/Bench_server(HF Transformers vs nano-vLLM 실측 벤치마크)와는
+  별개의 독립 포트폴리오 프로젝트다.
